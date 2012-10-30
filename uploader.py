@@ -45,8 +45,7 @@ class CloudFileStorage(object):
             return name, self.get(name)
 
     def has(self, name):
-        if self._container.list_objects(path=name, limit=1):
-            return True
+        return bool(self._container.list_objects(prefix=name, limit=1))
 
     def has_many(self, names):
         return all(self.has(name) for name in names)
@@ -146,11 +145,17 @@ class DirectoryUploader(object):
         with qworker.Mothership(producer, consumers) as m:
             m.start()
 
+    def purge(self):
+        container = CloudFileStorage(self._user,
+                                     self._api_key,
+                                     self._container_name
+                                     )
+        container.purge()
+        logging.info('container %s purged!' % self._container_name)
+
     def check(self):
         pass
 
-    def purge(self):
-        pass
 
 
 if __name__ == '__main__':
