@@ -7,14 +7,12 @@ Created on Oct 30, 2012
 '''
 import os
 import logging
-import qworker
+import traceback
 import cloudfiles
 
+import qworker
+
 logging.basicConfig(level=logging.DEBUG)
-
-
-def progress_callback(current, full):
-    logging.info('uploading... %d/%d' % (current, full))
 
 
 class CloudFileStorage(object):
@@ -26,22 +24,17 @@ class CloudFileStorage(object):
         @param user: user name
         @param api_key: api_key of CloudFiles
         @param container_name: name of container
-        @param create: create new container, error on existing.
         """
         self._conn = cloudfiles.Connection(user, api_key)
         self._container = self._conn.create_container(container_name)
 
-    def put(self, name, data, overwrite=False):
-        if not overwrite:
-            name = self._container.list_objects(path=name, limit=1)
-            if name:
-                raise RuntimeError('%s already exists' % name)
+    def put(self, name, data):
         obj = self._container.create_object(name)
-        obj.write(data, verify=True, callback=progress_callback)
+        obj.write(data, verify=True)
 
-    def put_many(self, name_data_dict, overwrite=False):
+    def put_many(self, name_data_dict):
         for name, data in name_data_dict:
-            self.put(name, data, overwrite)
+            self.put(name, data)
 
     def get(self, name):
         obj = self._container.get_object(name)
@@ -50,6 +43,13 @@ class CloudFileStorage(object):
     def get_many(self, names):
         for name in names:
             return name, self.get(name)
+
+    def has(self, name):
+        if self._container.list_objects(path=name, limit=1):
+            return True
+
+    def has_many(self, names):
+        return all(self.has(name) for name in names)
 
     def purge(self):
         names = self._container.list_objects()
@@ -113,21 +113,26 @@ class DirUploader(qworker.Consumer):
 
         for _i in range(10):
             try:
-                self._cloudfile.put(name, data, overwrite=self._overwrite)
-                logging.info('uploaded %s %s: %s' % (tag, name, filepath))
+                if not self._overwrite and self._cloudfile.has(name):
+                    logging.info('%s: %s already exists.' % (tag, name))
+                else:
+                    self._cloudfile.put(name, data)
+                    logging.info('%s: %s uploaded.' % (tag, name))
                 break
-            except Exception:
-                logging.info('retrying...')
+            except Exception as e:
+                logging.info('retrying...%s(%s)' % (e.__class__, str(e)))
 
 
 class DirectoryUploader(object):
 
-    def __init__(self, dirpath, user, api_key, container_name, overwrite=False):
+    def __init__(self, dirpath, user, api_key, container_name,
+                 overwrite=False, worker_num=1):
         self._dirpath = dirpath
         self._user = user
         self._api_key = api_key
         self._container_name = container_name
         self._overwrite = overwrite
+        self._work_num = worker_num
 
     def upload(self):
         producer = DirWalker(self._dirpath)
@@ -136,7 +141,7 @@ class DirectoryUploader(object):
                             container_name=self._container_name,
                             overwrite=self._overwrite
                             )
-                         for i in range(3)
+                         for _i in range(self._work_num)
                          )
         with qworker.Mothership(producer, consumers) as m:
             m.start()
