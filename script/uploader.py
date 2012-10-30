@@ -138,7 +138,7 @@ class DirectoryUploader(object):
                             )
                          for i in range(3)
                          )
-        with qworker.Mothership(producer, consumers, 3) as m:
+        with qworker.Mothership(producer, consumers) as m:
             m.start()
 
     def check(self):
