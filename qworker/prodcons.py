@@ -5,16 +5,22 @@ Created on May 24, 2012
 '''
 import time
 import logging
+import signal
 import Queue
 import traceback
-from copy import deepcopy
-from multiprocessing import Process, JoinableQueue, cpu_count
+from multiprocessing import Process, JoinableQueue, Event, cpu_count
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger()
 
 BLOCK_TIMEOUT = 0.01
 
+
+__all__ = ['Producer', 'Consumer', 'Mothership']
+
+
+class TerminalException(KeyboardInterrupt):
+    pass
 
 #==============================================================================
 # Producer Proxy
@@ -31,13 +37,25 @@ class ProducerProxy(Process):
         Process.__init__(self)
         self._queue = queue
         self._producer = producer
-        self.daemon = True
+        self._stop = Event()
+        self._stop.clear()
 
     def items(self):
         return self._producer.items()
 
+    def close(self):
+        self._producer.close()
+
+    def stop(self):
+        self._stop.set()
+
     def run(self):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         for item in self.items():
+
+            if self._stop.is_set():
+                self.close()
+                break
 
             while True:
                 try:
@@ -49,7 +67,7 @@ class ProducerProxy(Process):
 
 
 #==============================================================================
-# Consumer
+# Consumer Proxy
 #==============================================================================
 class ConsumerProxy(Process):
 
@@ -63,13 +81,26 @@ class ConsumerProxy(Process):
         Process.__init__(self)
         self._queue = queue
         self._consumer = consumer
-        self.daemon = True
+        self._stop = Event()
+        self._stop.clear()
 
     def consume(self, task):
         self._consumer.consume(task)
 
+    def close(self):
+        self._consumer.close()
+
+    def stop(self):
+        self._stop.set()
+
     def run(self):
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
         while True:
+
+            if self._stop.is_set():
+                self.close()
+                break
+
             try:
                 task = self._queue.get(timeout=BLOCK_TIMEOUT)
             except Queue.Empty:
@@ -112,23 +143,46 @@ class Mothership(object):
 
     """ Monitor of producer and consumers """
 
-    def __init__(self, producer, consumers):
+    def __init__(self, producer, consumers, graceful=False):
         self._queue = JoinableQueue()
 
         self._producer_proxy = ProducerProxy(self._queue, producer)
         self._consumer_pool = list(ConsumerProxy(self._queue, cons) for cons in consumers)
+        self._graceful = graceful
 
     def start(self):
-        """ Start working """
-        logger.info('Starting Producers'.center(20, '='))
-        self._producer_proxy.start()
+        try:
+            """ Start working """
+            logger.info('Starting Producers'.center(20, '='))
+            self._producer_proxy.start()
 
-        logger.info('Starting Consumers'.center(20, '='))
-        for consumer in self._consumer_pool:
-            consumer.start()
+            time.sleep(0.1)
 
-        self._producer_proxy.join()
-        self._queue.join()
+            logger.info('Starting Consumers'.center(20, '='))
+            for consumer in self._consumer_pool:
+                consumer.start()
+
+            self._producer_proxy.join()
+            self._queue.join()
+            for consumer in self._consumer_pool:
+                consumer.join()
+
+            self._queue.close()
+
+        except KeyboardInterrupt:
+
+            self._producer_proxy.stop()
+            self._producer_proxy.join()
+
+            if self._graceful:
+                logger.info('Shutting Down gracefully...')
+                self._queue.join()
+
+            for consumer in self._consumer_pool:
+                consumer.stop()
+                consumer.join()
+
+            self._queue.close()
 
     def __enter__(self):
         return self
@@ -140,21 +194,14 @@ class Mothership(object):
 #==============================================================================
 # Test
 #==============================================================================
-class TestTask(object):
-
-    def __init__(self, num):
-        self._num = num
-
-    @property
-    def num(self):
-        return self._num
-
-
 class TestMaster(Producer):
 
     def items(self):
-        for i in range(10000):
-            yield TestTask(i)
+        for i in range(100):
+            yield i
+
+    def close(self):
+        logger.info('Master stopped')
 
 
 class TestSlaver(Consumer):
@@ -163,14 +210,17 @@ class TestSlaver(Consumer):
         self._tag = tag
 
     def consume(self, task):
-        logger.info('%s-%d' % (self._tag, task.num))
+        logger.info('%s-%d' % (self._tag, task))
         time.sleep(0.1)
+
+    def close(self):
+        logger.info('%s stopped' % self._tag)
 
 
 def main():
 
     master = TestMaster()
-    slavers = (TestSlaver('test') for i in range(100))
+    slavers = (TestSlaver('slaver-%d' % i) for i in range(cpu_count() + 4))
 
     with Mothership(master, slavers) as m:
         m.start()
